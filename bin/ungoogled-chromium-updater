@@ -3,17 +3,28 @@
 # ungoogled-chromium-updater — setup/admin CLI for the SwiftBar plugin that
 # keeps ungoogled-chromium up to date.
 #
+# The menu-bar updater's lifecycle is tied to Chromium: a small launchd agent
+# starts SwiftBar when Chromium is running and quits it when Chromium quits, so
+# there's no menu-bar clutter when you're not browsing. (Exception: when
+# Chromium isn't installed yet, the icon stays up so you can install it.)
+#
 # Subcommands:
-#   setup       Wire the plugin into SwiftBar and (re)launch it  (default)
-#   uninstall   Remove the plugin from SwiftBar's plugin folder
+#   setup       Link the plugin into SwiftBar and install the lifecycle agent  (default)
+#   uninstall   Remove the plugin and the lifecycle agent (keeps SwiftBar)
 #   check       Run the plugin once and print its menu output
 #   path        Print the resolved plugin path
+#   watch-tick  One lifecycle check (start/stop SwiftBar); run by the agent
 #
 set -euo pipefail
 
 PLUGIN_NAME="ungoogled-chromium.3h.sh"
 SWIFTBAR_DOMAIN="com.ameba.SwiftBar"
 DEFAULT_PLUGIN_DIR="${HOME}/Library/Application Support/SwiftBar/Plugins"
+
+WATCH_LABEL="com.ungoogled-chromium-updater.watcher"
+LAUNCH_AGENTS_DIR="${HOME}/Library/LaunchAgents"
+PLIST="${LAUNCH_AGENTS_DIR}/${WATCH_LABEL}.plist"
+WATCH_INTERVAL=5   # seconds between lifecycle checks
 
 err() { printf '%s\n' "$*" >&2; }
 
@@ -33,8 +44,101 @@ resolve_plugin() {
   return 1
 }
 
+# Stable absolute path to invoke for the launchd agent. Prefer a PATH-resolved
+# command (e.g. the Homebrew bin symlink, which survives formula upgrades) over
+# a resolved $0 that could bake in a versioned Cellar path.
+launcher_path() {
+  local c; c="$(command -v ungoogled-chromium-updater 2>/dev/null || true)"
+  if [ -n "$c" ]; then echo "$c"; return 0; fi
+  case "$0" in
+    /*) echo "$0" ;;
+    *)  echo "$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" ;;
+  esac
+}
+
 swiftbar_plugin_dir() {
   defaults read "$SWIFTBAR_DOMAIN" PluginDirectory 2>/dev/null || true
+}
+
+# --- lifecycle predicates -----------------------------------------------------
+chromium_running()   { pgrep -f "/Chromium.app/" >/dev/null 2>&1; }
+swiftbar_running()   { pgrep -x "SwiftBar" >/dev/null 2>&1; }
+chromium_installed() { [ -d "/Applications/Chromium.app" ]; }
+start_swiftbar()     { [ -d "/Applications/SwiftBar.app" ] && open -ga SwiftBar; }
+# Quit via SIGTERM, not an Apple Event: a launchd agent can't get TCC Automation
+# permission to `osascript -e 'quit app ...'`, so that would silently fail.
+stop_swiftbar()      { pkill -x SwiftBar >/dev/null 2>&1 || true; }
+
+# One lifecycle check: SwiftBar should run iff Chromium is running, OR Chromium
+# isn't installed yet (so the install action stays reachable).
+cmd_watch_tick() {
+  if [ -n "${UCU_DEBUG:-}" ]; then
+    printf '[%s] chromium=%s swiftbar=%s installed=%s\n' \
+      "$(date '+%H:%M:%S')" \
+      "$(chromium_running && echo y || echo n)" \
+      "$(swiftbar_running && echo y || echo n)" \
+      "$(chromium_installed && echo y || echo n)"
+  fi
+  if chromium_running || ! chromium_installed; then
+    swiftbar_running || start_swiftbar
+  else
+    if swiftbar_running; then
+      stop_swiftbar
+      [ -n "${UCU_DEBUG:-}" ] && printf '  -> stop_swiftbar rc=%s\n' "$?"
+    fi
+  fi
+  return 0
+}
+
+# Long-running loop for the launchd agent. We use a KeepAlive daemon that sleeps
+# between checks rather than a StartInterval job, because launchd throttles
+# fast-exiting jobs to a 10s minimum respawn — a resident loop gives a true
+# WATCH_INTERVAL cadence. KeepAlive restarts us if we ever die.
+cmd_watch_loop() {
+  while :; do
+    cmd_watch_tick
+    sleep "$WATCH_INTERVAL"
+  done
+}
+
+write_plist() {
+  local launcher; launcher="$(launcher_path)"
+  mkdir -p "$LAUNCH_AGENTS_DIR"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${WATCH_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>${launcher}</string>
+        <string>watch-loop</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
+EOF
+}
+
+load_watcher() {
+  local uid; uid="$(id -u)"
+  launchctl bootout "gui/$uid/$WATCH_LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$uid" "$PLIST" 2>/dev/null \
+    || launchctl load -w "$PLIST" 2>/dev/null || true
+}
+
+unload_watcher() {
+  local uid; uid="$(id -u)"
+  launchctl bootout "gui/$uid/$WATCH_LABEL" 2>/dev/null \
+    || launchctl unload -w "$PLIST" 2>/dev/null || true
 }
 
 cmd_setup() {
@@ -61,29 +165,34 @@ cmd_setup() {
   ln -sf "$plugin" "$dir/$PLUGIN_NAME"
   echo "Linked plugin → $dir/$PLUGIN_NAME"
 
-  # (Re)launch SwiftBar so it adopts the folder / new plugin.
-  osascript -e 'quit app "SwiftBar"' >/dev/null 2>&1 || true
-  sleep 1
-  open -a SwiftBar
+  # Install + start the lifecycle agent (it owns starting/stopping SwiftBar).
+  write_plist
+  load_watcher
+  echo "Installed lifecycle agent → $PLIST"
+  cmd_watch_tick   # sync state immediately
+
   echo
-  echo "✅ Done. Look for the Chromium status icon in your menu bar."
-  echo "   It checks for updates every 3 hours; click it to update on demand."
+  echo "✅ Done. The Chromium update icon now appears whenever Chromium is"
+  echo "   running and disappears when you quit it. Click it to update on demand."
 }
 
 cmd_uninstall() {
+  unload_watcher
+  rm -f "$PLIST" && echo "Removed lifecycle agent."
   local dir; dir="$(swiftbar_plugin_dir)"
   [ -n "$dir" ] && rm -f "$dir/$PLUGIN_NAME" && echo "Removed $dir/$PLUGIN_NAME"
-  osascript -e 'quit app "SwiftBar"' >/dev/null 2>&1 || true
-  open -a SwiftBar 2>/dev/null || true
-  echo "Plugin removed. (SwiftBar itself was left installed.)"
+  stop_swiftbar
+  echo "Removed. (SwiftBar itself was left installed.)"
 }
 
 case "${1:-setup}" in
-  setup)     cmd_setup ;;
-  uninstall) cmd_uninstall ;;
-  check)     exec "$(resolve_plugin)" ;;
-  path)      resolve_plugin ;;
+  setup)      cmd_setup ;;
+  uninstall)  cmd_uninstall ;;
+  check)      exec "$(resolve_plugin)" ;;
+  path)       resolve_plugin ;;
+  watch-tick) cmd_watch_tick ;;
+  watch-loop) cmd_watch_loop ;;
   -h|--help|help)
-    sed -n '3,10p' "$0" | sed 's/^# \{0,1\}//' ;;
-  *) err "Unknown command: $1"; err "Try: setup | uninstall | check | path"; exit 2 ;;
+    sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) err "Unknown command: $1"; err "Try: setup | uninstall | check | path | watch-tick"; exit 2 ;;
 esac
