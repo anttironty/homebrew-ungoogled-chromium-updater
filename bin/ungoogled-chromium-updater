@@ -1,0 +1,89 @@
+#!/bin/bash
+#
+# ungoogled-chromium-updater — setup/admin CLI for the SwiftBar plugin that
+# keeps ungoogled-chromium up to date.
+#
+# Subcommands:
+#   setup       Wire the plugin into SwiftBar and (re)launch it  (default)
+#   uninstall   Remove the plugin from SwiftBar's plugin folder
+#   check       Run the plugin once and print its menu output
+#   path        Print the resolved plugin path
+#
+set -euo pipefail
+
+PLUGIN_NAME="ungoogled-chromium.3h.sh"
+SWIFTBAR_DOMAIN="com.ameba.SwiftBar"
+DEFAULT_PLUGIN_DIR="${HOME}/Library/Application Support/SwiftBar/Plugins"
+
+err() { printf '%s\n' "$*" >&2; }
+
+# Locate the plugin script: dev checkout first, then Homebrew prefix, then env.
+resolve_plugin() {
+  if [ -n "${UCU_PLUGIN:-}" ] && [ -f "${UCU_PLUGIN}" ]; then
+    echo "${UCU_PLUGIN}"; return 0
+  fi
+  local here; here="$(cd "$(dirname "$0")" && pwd)"
+  if [ -f "${here}/../plugins/${PLUGIN_NAME}" ]; then
+    (cd "${here}/../plugins" && pwd -P | sed "s|$|/${PLUGIN_NAME}|"); return 0
+  fi
+  if command -v brew >/dev/null 2>&1; then
+    local p="$(brew --prefix)/share/ungoogled-chromium-updater/${PLUGIN_NAME}"
+    [ -f "$p" ] && { echo "$p"; return 0; }
+  fi
+  return 1
+}
+
+swiftbar_plugin_dir() {
+  defaults read "$SWIFTBAR_DOMAIN" PluginDirectory 2>/dev/null || true
+}
+
+cmd_setup() {
+  local plugin; plugin="$(resolve_plugin)" || { err "Could not find ${PLUGIN_NAME}."; exit 1; }
+  chmod +x "$plugin" 2>/dev/null || true
+
+  if ! [ -d "/Applications/SwiftBar.app" ]; then
+    err "SwiftBar is not installed. Install it with:"
+    err "  brew install --cask swiftbar"
+    exit 1
+  fi
+
+  # Respect an existing plugin folder; otherwise establish a default one.
+  local dir; dir="$(swiftbar_plugin_dir)"
+  if [ -z "$dir" ]; then
+    dir="$DEFAULT_PLUGIN_DIR"
+    mkdir -p "$dir"
+    defaults write "$SWIFTBAR_DOMAIN" PluginDirectory -string "$dir"
+    echo "Set SwiftBar plugin folder to: $dir"
+  fi
+  mkdir -p "$dir"
+
+  # Symlink so future `brew upgrade` of this formula updates the live plugin.
+  ln -sf "$plugin" "$dir/$PLUGIN_NAME"
+  echo "Linked plugin → $dir/$PLUGIN_NAME"
+
+  # (Re)launch SwiftBar so it adopts the folder / new plugin.
+  osascript -e 'quit app "SwiftBar"' >/dev/null 2>&1 || true
+  sleep 1
+  open -a SwiftBar
+  echo
+  echo "✅ Done. Look for the Chromium status icon in your menu bar."
+  echo "   It checks for updates every 3 hours; click it to update on demand."
+}
+
+cmd_uninstall() {
+  local dir; dir="$(swiftbar_plugin_dir)"
+  [ -n "$dir" ] && rm -f "$dir/$PLUGIN_NAME" && echo "Removed $dir/$PLUGIN_NAME"
+  osascript -e 'quit app "SwiftBar"' >/dev/null 2>&1 || true
+  open -a SwiftBar 2>/dev/null || true
+  echo "Plugin removed. (SwiftBar itself was left installed.)"
+}
+
+case "${1:-setup}" in
+  setup)     cmd_setup ;;
+  uninstall) cmd_uninstall ;;
+  check)     exec "$(resolve_plugin)" ;;
+  path)      resolve_plugin ;;
+  -h|--help|help)
+    sed -n '3,10p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) err "Unknown command: $1"; err "Try: setup | uninstall | check | path"; exit 2 ;;
+esac
